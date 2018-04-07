@@ -1,0 +1,290 @@
+#!/usr/bin/python2.7
+
+""" Streamlink Daemon """
+
+import os
+import sys
+import time
+import atexit
+import traceback
+import platform
+from websocket import __version__ as websocket_version
+from requests import __version__ as requests_version
+from platform import node as hostname
+
+from signal import SIGTERM
+
+from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
+from SocketServer import ThreadingMixIn
+from streamlink import Streamlink
+from streamlink.stream.ffmpegmux import MuxedStream
+from streamlink import (StreamlinkError, PluginError, NoStreamsError, NoPluginError,  StreamError)
+from streamlink import __version__ as streamlink_version
+from streamlink import __version_date__ as streamlink_version_date
+from urllib import unquote
+from threading import Lock
+
+PORT_NUMBER = 8088	# change it to 88 for livestreamersrv compatibility
+STREAMLINK = None
+LOGGER = None
+LOGLEVEL = "info"	# "none", "error", "warning", "info" or "debug"
+FFMPEG_VERBOSE = True
+
+
+def Stream(wfile, url, quality):
+	try:
+		Streamer(wfile, url, quality)
+	except NoPluginError:
+		LOGGER.error("Streamlink is unable to handle the URL '{0}'", url)
+		wfile.write(open("/usr/share/offline.mp4", "r").read())
+	except PluginError as err:
+		LOGGER.error("Plugin error: {0}", err)
+		wfile.write(open("/usr/share/offline.mp4", "r").read())
+	except Exception as err:
+		if LOGLEVEL == "debug":
+			LOGGER.error("Got exception:\n{0}", traceback.format_exc().splitlines())
+		else:
+			LOGGER.error("Got exception: {0}", err)
+		wfile.write(open("/usr/share/offline.mp4", "r").read())
+	finally:
+		wfile.close()
+
+
+def Streamer(wfile, url, quality):
+	global STREAMLINK
+	streams = STREAMLINK.streams(url)
+	if not streams:
+		raise Exception("No streams found on URL '{0}'".format(url))
+	LOGGER.info("Streams:\n{0}", streams.keys())
+	stream_quali = "medium"
+	for q in quality.split(','):
+		if q in streams:
+			stream_quali = q
+			break;
+	stream = streams[stream_quali]
+	LOGGER.debug("Stream selected: Q '{0}', URL '{1}'", stream_quali, stream)
+	fd = stream.open()
+	try:
+		while True:
+			buff = fd.read(4096)
+			if not buff:
+				raise Exception("No Data!")
+			wfile.write(buff)
+	except:
+		raise
+	finally:
+		if fd:
+			LOGGER.info("Closing currently open stream...")
+			fd.close()
+			raise Exception("End Of Data!")
+
+
+class StreamHandler(BaseHTTPRequestHandler):
+
+	def do_HEAD(s):
+		s.send_response(200)
+		s.send_header("Server", "Enigma2 Streamlink")
+		s.send_header("Content-type", "text/html")
+		s.end_headers()
+
+	def do_GET(s):
+		"""Respond to a GET request."""
+		s.send_response(200)
+		s.send_header("Server", "Enigma2 Streamlink")
+		s.send_header("Content-type", "text/html")
+		s.end_headers()
+
+		url=unquote(s.path[1:])
+		quality="best"
+
+		if url.startswith("q=") and url.index("/") > 0:
+			i = url.index("/")
+			quality = url[2:i]
+			url = url[i+1:]
+
+		s.log_message("URL: %s Quality: %s", url, quality)
+		Stream(s.wfile, url, quality)
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+	"""Handle requests in a separate thread."""
+
+
+def start():
+	global STREAMLINK, LOGGER
+	STREAMLINK = Streamlink()
+	LOGGER = STREAMLINK.logger.new_module("streamlinksrv")
+	STREAMLINK.set_loglevel(LOGLEVEL)
+	STREAMLINK.set_option("http-headers", "referrer=https://www.rampant.tv/channels")
+	STREAMLINK.set_option("ffmpeg-verbose", FFMPEG_VERBOSE)
+	#STREAMLINK.set_option("http-ssl-verify", False)
+	#STREAMLINK.set_option("hls-segment-threads", 2)
+	#STREAMLINK.set_plugin_option("plugin_name", "email", "your_email_address")
+	#STREAMLINK.set_plugin_option("plugin_name", "password", "your_password")
+	httpd = ThreadedHTTPServer(("", PORT_NUMBER), StreamHandler)
+	LOGGER.info("{0} Server started - Host: {1}, Port: {2}", time.asctime(), hostname(), PORT_NUMBER)
+	LOGGER.info("Python:     {0}".format(platform.python_version()))
+	LOGGER.info("Streamlink: {0} / {1}".format(streamlink_version, streamlink_version_date))
+	LOGGER.info("Requests({0}), Websocket({1})".format(requests_version, websocket_version))
+	if MuxedStream.is_usable(STREAMLINK):
+		LOGGER.info("ffmpeg is usable.")
+	try:
+		httpd.serve_forever()
+	except KeyboardInterrupt:
+		pass
+	httpd.server_close()
+	LOGGER.info("{0} Server stopped - Host: {1}, Port: {2}", time.asctime(), hostname(), PORT_NUMBER)
+
+
+class Daemon:
+	"""
+	A generic daemon class.
+
+	Usage: subclass the Daemon class and override the run() method
+	"""
+	def __init__(self, pidfile, stdin="/dev/null", stdout="/dev/null", stderr="/dev/null"):
+		self.stdin = stdin
+		self.stdout = stdout
+		self.stderr = stderr
+		self.pidfile = pidfile
+
+	def daemonize(self):
+		"""
+		do the UNIX double-fork magic, see Stevens' "Advanced
+		Programming in the UNIX Environment" for details (ISBN 0201563177)
+		http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
+		"""
+		try:
+			pid = os.fork()
+			if pid > 0:
+				# exit first parent
+				sys.exit(0)
+		except OSError, e:
+			sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+			sys.exit(1)
+
+		# decouple from parent environment
+		os.chdir("/")
+		os.setsid()
+		os.umask(0)
+
+		# do second fork
+		try:
+			pid = os.fork()
+			if pid > 0:
+				# exit from second parent
+				sys.exit(0)
+		except OSError, e:
+			sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+			sys.exit(1)
+
+		# redirect standard file descriptors
+		sys.stdout.flush()
+		sys.stderr.flush()
+		si = file(self.stdin, "r")
+		so = file(self.stdout, "a+")
+		se = file(self.stderr, "a+", 0)
+		os.dup2(si.fileno(), sys.stdin.fileno())
+		os.dup2(so.fileno(), sys.stdout.fileno())
+		os.dup2(se.fileno(), sys.stderr.fileno())
+
+		# write pidfile
+		atexit.register(self.delpid)
+		pid = str(os.getpid())
+		file(self.pidfile,"w+").write("%s\n" % pid)
+
+	def delpid(self):
+		os.remove(self.pidfile)
+
+	def start(self):
+		"""
+		Start the daemon
+		"""
+		# Check for a pidfile to see if the daemon already runs
+		try:
+			pf = file(self.pidfile,"r")
+			pid = int(pf.read().strip())
+			pf.close()
+		except IOError:
+			pid = None
+
+		if pid:
+			message = "pidfile %s already exist. Daemon already running?\n"
+			sys.stderr.write(message % self.pidfile)
+			sys.exit(1)
+
+		# Start the daemon
+		self.daemonize()
+		self.run()
+
+	def stop(self):
+		"""
+		Stop the daemon
+		"""
+		# Get the pid from the pidfile
+		try:
+			pf = file(self.pidfile,"r")
+			pid = int(pf.read().strip())
+			pf.close()
+		except IOError:
+			pid = None
+
+		if not pid:
+			message = "pidfile %s does not exist. Daemon not running?\n"
+			sys.stderr.write(message % self.pidfile)
+			return # not an error in a restart
+
+		# Try killing the daemon process
+		try:
+			while 1:
+				os.kill(pid, SIGTERM)
+				time.sleep(0.1)
+		except OSError, err:
+			err = str(err)
+			if err.find("No such process") > 0:
+				if os.path.exists(self.pidfile):
+					os.remove(self.pidfile)
+			else:
+				print str(err)
+				sys.exit(1)
+
+	def restart(self):
+		"""
+		Restart the daemon
+		"""
+		self.stop()
+		self.start()
+
+	def run(self):
+		"""
+		You should override this method when you subclass Daemon. It will be called after the process has been
+		daemonized by start() or restart().
+		"""
+
+
+class StreamlinkDaemon(Daemon):
+	def run(self):
+		start()
+
+
+if __name__ == "__main__":
+	daemon = StreamlinkDaemon("/var/run/streamlink.pid")
+	if len(sys.argv) == 2:
+		if "start" == sys.argv[1]:
+			daemon.start()
+		elif "stop" == sys.argv[1]:
+			daemon.stop()
+		elif "restart" == sys.argv[1]:
+			daemon.restart()
+		elif "manualstart" == sys.argv[1]:
+			daemon.stop()
+			start()
+		else:
+			print "Unknown command"
+			sys.exit(2)
+		sys.exit(0)
+	else:
+		print "usage: %s start|stop|restart|manualstart" % sys.argv[0]
+		print "       manualstart include a stop"
+		sys.exit(2)
+
